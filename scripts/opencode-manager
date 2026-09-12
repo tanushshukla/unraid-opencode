@@ -1,0 +1,79 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+BASE=/mnt/user/appdata/opencode
+PLUGIN=/usr/local/emhttp/plugins/opencode
+fail() { echo "OpenCode: $*" >&2; exit 1; }
+mounted() { mountpoint -q /mnt/user; }
+prepare() {
+    mounted || fail 'Start the array first; /mnt/user is not mounted.'
+    mkdir -p "$BASE"/{bin,config,data,state,cache}
+    chmod 700 "$BASE"
+    # Copy once; retain the original files and preserve existing appdata files.
+    if [[ ! -e "$BASE/.migrated" ]]; then
+        if pgrep -x opencode >/dev/null; then
+            fail 'Close existing OpenCode sessions before the first migration.'
+        fi
+        for pair in '.config config' '.local/share data' '.local/state state'; do
+            read -r src dest <<< "$pair"
+            if [[ -d "/root/$src/opencode" ]]; then
+                mkdir -p "$BASE/$dest/opencode"
+                cp -an "/root/$src/opencode/." "$BASE/$dest/opencode/"
+            fi
+        done
+        touch "$BASE/.migrated"
+    fi
+}
+install_binary() (
+    local version=${1:-latest} target=linux-x64 url stage
+    [[ $(uname -m) == x86_64 ]] || fail 'This plugin currently supports x86_64 only.'
+    [[ "$version" == latest || "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || fail 'Invalid version.'
+    grep -qwi avx2 /proc/cpuinfo || target=linux-x64-baseline
+    if [[ "$version" == latest ]]; then
+        url="https://github.com/anomalyco/opencode/releases/latest/download/opencode-$target.tar.gz"
+    else
+        url="https://github.com/anomalyco/opencode/releases/download/v${version#v}/opencode-$target.tar.gz"
+    fi
+    stage=$(mktemp -d "$BASE/.install.XXXXXX")
+    trap 'rm -rf -- "$stage"' EXIT
+    curl --fail --location --show-error --silent --connect-timeout 20 --max-time 600 --retry 2 "$url" -o "$stage/release.tar.gz" || fail 'Download failed; existing binary retained.'
+    # Extract only the expected executable, never arbitrary archive paths.
+    tar -xzf "$stage/release.tar.gz" -C "$stage" --no-same-owner --no-same-permissions opencode || fail 'Invalid release archive.'
+    [[ -f "$stage/opencode" && ! -L "$stage/opencode" ]] || fail 'Missing executable.'
+    chmod 700 "$stage/opencode"
+    timeout 30 "$stage/opencode" --version || fail 'Binary cannot run on this server; existing binary retained.'
+    if [[ -f "$BASE/bin/opencode" ]]; then
+        cp -p "$BASE/bin/opencode" "$stage/previous"
+        mv -f "$stage/previous" "$BASE/bin/opencode.previous"
+    fi
+    mv -f "$stage/opencode" "$BASE/bin/opencode"
+    echo 'OpenCode binary installed successfully.'
+)
+case "${1:-ensure}" in
+    boot)
+        for ((attempt=0; attempt<120; attempt++)); do
+            mounted && exec "$0" ensure
+            sleep 5
+        done
+        echo 'Array not mounted yet. Run opencode after starting the array.'
+        exit 0
+        ;;
+    ensure|update|rollback)
+        mounted || fail 'Start the array first; /mnt/user is not mounted.'
+        exec 9>/var/lock/opencode-plugin.lock
+        flock -w 660 9 || fail 'Another installation is in progress.'
+        prepare
+        export XDG_CONFIG_HOME="$BASE/config" XDG_DATA_HOME="$BASE/data"
+        export XDG_STATE_HOME="$BASE/state" XDG_CACHE_HOME="$BASE/cache"
+        case "${1:-ensure}" in
+            ensure) [[ -x "$BASE/bin/opencode" ]] || install_binary ;;
+            update) install_binary "${2:-latest}" ;;
+            rollback)
+                [[ -x "$BASE/bin/opencode.previous" ]] || fail 'No previous binary available.'
+                cp -p "$BASE/bin/opencode.previous" "$BASE/bin/opencode.restore"
+                mv -f "$BASE/bin/opencode.restore" "$BASE/bin/opencode"
+                ;;
+        esac
+        ;;
+    *) fail 'Usage: opencode-manager {ensure|update [version]|rollback|boot}' ;;
+esac

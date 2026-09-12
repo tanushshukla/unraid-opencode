@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+BASE=/mnt/user/appdata/opencode
+/usr/local/emhttp/plugins/opencode/scripts/opencode-manager ensure
+export XDG_CONFIG_HOME="$BASE/config"
+export XDG_DATA_HOME="$BASE/data"
+export XDG_STATE_HOME="$BASE/state"
+export XDG_CACHE_HOME="$BASE/cache"
+exec "$BASE/bin/opencode" "$@"
