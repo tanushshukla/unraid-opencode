@@ -4,11 +4,12 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 root = Path(__file__).resolve().parent
 parts = ['''<?xml version="1.0" standalone="yes"?>
-<PLUGIN name="opencode" author="tanushshukla" version="2026.10.10a" min="7.1.4"
+<PLUGIN name="opencode" author="tanushshukla" version="2026.10.10b" min="7.1.4"
  pluginURL="https://raw.githubusercontent.com/tanushshukla/unraid-opencode/main/opencode.plg"
  supportURL="https://github.com/tanushshukla/unraid-opencode/issues">
 <DESCRIPTION>OpenCode CLI with persistent appdata. Target: Unraid 7.1.4 and later.</DESCRIPTION>
-<CHANGES>2026.10.10a: Fix plugin updates leaving the previous management script in place.
+<CHANGES>2026.10.10b: Fall back to the npm registry when the OpenCode update service is unavailable.
+2026.10.10a: Fix plugin updates leaving the previous management script in place.
 2026.10.10: OpenCode 2 support. Installs from the official npm packages with SHA-512 verification, backs up the database and configuration when switching between OpenCode 1 and 2, and stops the OpenCode 2 background server when the array stops.
 2026.09.12: Initial release. Persistent storage, guarded migration, explicit updates and rollback.</CHANGES>
 ''']

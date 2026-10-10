@@ -81,9 +81,16 @@ install_binary() (
         # OpenCode 2 is published to npm, as used by https://opencode.ai/v2/install.
         scope=@opencode
         if [[ "$version" == latest ]]; then
-            meta=$(get https://opencode.ai/update/api/latest/cli/npm) || fail 'Could not fetch the latest version; existing binary retained.'
+            meta=$(get https://opencode.ai/update/api/latest/cli/npm 2>/dev/null) || meta=
             version=$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' <<< "$meta")
             scope=$(sed -n 's/.*"package":"\([^"]*\)\/cli".*/\1/p' <<< "$meta")
+            if [[ -z "$version" || -z "$scope" ]]; then
+                # The update service is occasionally unavailable; npm's latest tag names the same release.
+                echo 'OpenCode update service unavailable; asking the npm registry instead.' >&2
+                scope=@opencode
+                meta=$(get "https://registry.npmjs.org/$scope%2fcli-$target/latest") || fail 'Could not fetch the latest version; existing binary retained.'
+                version=$(grep -oE '"version":"[^"]*"' <<< "$meta" | head -n 1 | cut -d'"' -f4)
+            fi
             [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ && "$scope" =~ ^@opencode(-ai)?$ ]] || fail 'Unexpected version information.'
         fi
         # Older releases were published under the previous package scope.

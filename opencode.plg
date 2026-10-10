@@ -1,9 +1,10 @@
 <?xml version="1.0" standalone="yes"?>
-<PLUGIN name="opencode" author="tanushshukla" version="2026.10.10a" min="7.1.4"
+<PLUGIN name="opencode" author="tanushshukla" version="2026.10.10b" min="7.1.4"
  pluginURL="https://raw.githubusercontent.com/tanushshukla/unraid-opencode/main/opencode.plg"
  supportURL="https://github.com/tanushshukla/unraid-opencode/issues">
 <DESCRIPTION>OpenCode CLI with persistent appdata. Target: Unraid 7.1.4 and later.</DESCRIPTION>
-<CHANGES>2026.10.10a: Fix plugin updates leaving the previous management script in place.
+<CHANGES>2026.10.10b: Fall back to the npm registry when the OpenCode update service is unavailable.
+2026.10.10a: Fix plugin updates leaving the previous management script in place.
 2026.10.10: OpenCode 2 support. Installs from the official npm packages with SHA-512 verification, backs up the database and configuration when switching between OpenCode 1 and 2, and stops the OpenCode 2 background server when the array stops.
 2026.09.12: Initial release. Persistent storage, guarded migration, explicit updates and rollback.</CHANGES>
 <FILE Run="/bin/bash"><INLINE><![CDATA[set -e
@@ -100,9 +101,16 @@ install_binary() (
         # OpenCode 2 is published to npm, as used by https://opencode.ai/v2/install.
         scope=@opencode
         if [[ "$version" == latest ]]; then
-            meta=$(get https://opencode.ai/update/api/latest/cli/npm) || fail 'Could not fetch the latest version; existing binary retained.'
+            meta=$(get https://opencode.ai/update/api/latest/cli/npm 2>/dev/null) || meta=
             version=$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' <<< "$meta")
             scope=$(sed -n 's/.*"package":"\([^"]*\)\/cli".*/\1/p' <<< "$meta")
+            if [[ -z "$version" || -z "$scope" ]]; then
+                # The update service is occasionally unavailable; npm's latest tag names the same release.
+                echo 'OpenCode update service unavailable; asking the npm registry instead.' >&2
+                scope=@opencode
+                meta=$(get "https://registry.npmjs.org/$scope%2fcli-$target/latest") || fail 'Could not fetch the latest version; existing binary retained.'
+                version=$(grep -oE '"version":"[^"]*"' <<< "$meta" | head -n 1 | cut -d'"' -f4)
+            fi
             [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ && "$scope" =~ ^@opencode(-ai)?$ ]] || fail 'Unexpected version information.'
         fi
         # Older releases were published under the previous package scope.

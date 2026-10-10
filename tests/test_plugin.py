@@ -123,6 +123,15 @@ if [[ -n "$out" ]]; then cp "$f" "$out"; else cat "$f"; fi''')
         r=subprocess.run([str(self.base/'bin/opencode'),'--version'],capture_output=True,text=True)
         self.assertEqual(r.stdout.strip(),'opencode v2.0.26')
         self.assertFalse(any('github.com' in u for u in self.requests()))
+    def test_latest_falls_back_to_npm_when_update_service_fails(self):
+        self.publish_v2()
+        (self.fixtures/'https___opencode.ai_update_api_latest_cli_npm').unlink()
+        self.fixture('https://registry.npmjs.org/@opencode%2fcli-linux-x64/latest',
+                     (self.fixtures/'https___registry.npmjs.org_@opencode_2fcli-linux-x64_2.0.26').read_bytes()
+                     .replace(b'{"name"',b'{"version":"2.0.26","name"'))
+        r=self.run_manager('ensure')
+        self.assertIn('asking the npm registry',r.stderr)
+        self.assertIn('opencode v2.0.26',subprocess.run([str(self.base/'bin/opencode'),'--version'],capture_output=True,text=True).stdout)
     def test_checksum_mismatch_preserves_binary_and_cleans_stage(self):
         p=self.cached()
         before=p.read_bytes()
