@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Exercise persistence paths in temporary directories; never modify the host."""
+import base64
+import hashlib
+import io
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -20,7 +24,17 @@ class Persistence(unittest.TestCase):
         self.bin.mkdir()
         self.mock('mountpoint', 'exit "${MOUNT_EXIT:-0}"')
         self.mock('pgrep', 'exit 1')
-        self.mock('curl', 'echo download-failed >&2; exit 22')
+        self.mock('pkill', 'exit 1')
+        self.mock('uname', 'echo x86_64')
+        # Serve fixtures by URL; unknown URLs fail like an unreachable server.
+        self.fixtures = self.root/'fixtures'
+        self.fixtures.mkdir()
+        self.mock('curl', '''out=; url=
+while (($#)); do case $1 in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done
+echo "$url" >> "$FIXTURES/requests"
+f="$FIXTURES/$(printf %s "$url" | tr '/:%' '___')"
+[[ -f "$f" ]] || { echo download-failed >&2; exit 22; }
+if [[ -n "$out" ]]; then cp "$f" "$out"; else cat "$f"; fi''')
         self.manager = self.root/'manager'
         src = (ROOT/'scripts/opencode-manager').read_text()
         src = src.replace('/mnt/user/appdata/opencode', str(self.base))
@@ -28,15 +42,36 @@ class Persistence(unittest.TestCase):
         src = src.replace('/var/lock/opencode-plugin.lock', str(self.root/'lock'))
         self.manager.write_text(src)
         self.manager.chmod(0o700)
-        self.env = dict(os.environ, PATH=str(self.bin)+':'+os.environ['PATH'])
+        self.env = dict(os.environ, PATH=str(self.bin)+':'+os.environ['PATH'], FIXTURES=str(self.fixtures))
+    def fixture(self, url, data):
+        (self.fixtures/url.replace('/','_').replace(':','_').replace('%','_')).write_bytes(data)
+    def fake_binary(self, version):
+        return ('#!/bin/bash\ncase $1 in --version) echo "opencode v%s" ;; service) echo "$*" >> "%s" ;; esac\n'
+                % (version, self.root/'service-calls')).encode()
+    def publish_v2(self, version='2.0.26', corrupt=False):
+        buf=io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+            data=self.fake_binary(version)
+            info=tarfile.TarInfo('package/bin/opencode'); info.size=len(data); info.mode=0o755
+            tar.addfile(info, io.BytesIO(data))
+        package=buf.getvalue()
+        integrity=base64.b64encode(hashlib.sha512(package+(b'x' if corrupt else b'')).digest()).decode()
+        self.fixture('https://opencode.ai/update/api/latest/cli/npm',
+                     ('{"channel":"latest","name":"cli","version":"%s","metadata":{"package":"@opencode/cli"}}' % version).encode())
+        self.fixture('https://registry.npmjs.org/@opencode%%2fcli-linux-x64/%s' % version,
+                     ('{"name":"@opencode/cli-linux-x64","dist":{"integrity":"sha512-%s"}}' % integrity).encode())
+        self.fixture('https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-%s.tgz' % version, package)
+    def requests(self):
+        f=self.fixtures/'requests'
+        return f.read_text().split() if f.exists() else []
     def mock(self, name, body):
         p=self.bin/name
         p.write_text('#!/bin/bash\n'+body+'\n')
         p.chmod(0o700)
-    def cached(self):
-        (self.base/'bin').mkdir(parents=True)
+    def cached(self, version='1.18.35'):
+        (self.base/'bin').mkdir(parents=True, exist_ok=True)
         p=self.base/'bin/opencode'
-        p.write_text('#!/bin/bash\necho test-version\n')
+        p.write_bytes(self.fake_binary(version))
         p.chmod(0o700)
         return p
     def run_manager(self, *args, ok=True):
@@ -77,10 +112,78 @@ class Persistence(unittest.TestCase):
     def test_rollback(self):
         self.cached()
         prev=self.base/'bin/opencode.previous'
-        prev.write_text('#!/bin/bash\necho previous\n')
+        prev.write_bytes(self.fake_binary('1.18.34'))
+        prev.chmod(0o700)
+        expected=prev.read_bytes()
+        self.run_manager('rollback')
+        self.assertEqual((self.base/'bin/opencode').read_bytes(),expected)
+    def test_latest_installs_verified_v2_from_npm(self):
+        self.publish_v2()
+        self.run_manager('ensure')
+        r=subprocess.run([str(self.base/'bin/opencode'),'--version'],capture_output=True,text=True)
+        self.assertEqual(r.stdout.strip(),'opencode v2.0.26')
+        self.assertFalse(any('github.com' in u for u in self.requests()))
+    def test_checksum_mismatch_preserves_binary_and_cleans_stage(self):
+        p=self.cached()
+        before=p.read_bytes()
+        self.publish_v2(corrupt=True)
+        r=self.run_manager('update',ok=False)
+        self.assertIn('Checksum mismatch',r.stderr)
+        self.assertEqual(p.read_bytes(),before)
+        self.assertEqual(list(self.base.glob('.install.*')),[])
+    def test_upgrade_from_v1_backs_up_database_and_config(self):
+        v1=self.cached('1.18.35').read_bytes()
+        db=self.base/'data/opencode'
+        db.mkdir(parents=True)
+        (db/'opencode.db').write_text('v1-schema')
+        (db/'opencode.db-wal').write_text('wal')
+        (self.base/'config/opencode').mkdir(parents=True)
+        (self.base/'config/opencode/tui.json').write_text('{}')
+        self.publish_v2()
+        self.run_manager('update')
+        backups=list((self.base/'backup').glob('1.18.35-*'))
+        self.assertEqual(len(backups),1)
+        self.assertEqual((backups[0]/'data/opencode.db').read_text(),'v1-schema')
+        self.assertEqual((backups[0]/'data/opencode.db-wal').read_text(),'wal')
+        self.assertTrue((backups[0]/'config/tui.json').exists())
+        self.assertEqual((self.base/'bin/opencode.previous').read_bytes(),v1)
+    def test_upgrade_from_v1_refused_while_sessions_run(self):
+        p=self.cached('1.18.35')
+        before=p.read_bytes()
+        self.mock('pgrep','exit 0')
+        (self.base/'.migrated').touch()
+        self.publish_v2()
+        r=self.run_manager('update',ok=False)
+        self.assertIn('Close all OpenCode sessions',r.stderr)
+        self.assertEqual(p.read_bytes(),before)
+        self.assertFalse((self.base/'backup').exists())
+        self.assertEqual(list(self.base.glob('.install.*')),[])
+    def test_same_series_update_skips_backup(self):
+        self.cached('2.0.25')
+        self.publish_v2('2.0.26')
+        self.run_manager('update')
+        self.assertFalse((self.base/'backup').exists())
+    def test_pinned_v1_uses_github_release(self):
+        self.cached('2.0.26')
+        self.run_manager('update','1.18.35',ok=False)
+        self.assertEqual(self.requests(),['https://github.com/anomalyco/opencode/releases/download/v1.18.35/opencode-linux-x64.tar.gz'])
+    def test_rollback_to_v1_stops_service_and_backs_up(self):
+        self.cached('2.0.26')
+        prev=self.base/'bin/opencode.previous'
+        prev.write_bytes(self.fake_binary('1.18.35'))
         prev.chmod(0o700)
         self.run_manager('rollback')
-        self.assertEqual((self.base/'bin/opencode').read_bytes(),prev.read_bytes())
+        self.assertIn('opencode v1.18.35',subprocess.run([str(self.base/'bin/opencode'),'--version'],capture_output=True,text=True).stdout)
+        self.assertEqual(len(list((self.base/'backup').glob('2.0.26-*'))),1)
+        self.assertIn('service stop',(self.root/'service-calls').read_text())
+        self.assertFalse((self.base/'bin/opencode.restore').exists())
+    def test_stop_only_calls_v2_service(self):
+        self.cached('1.18.35')
+        self.run_manager('stop')
+        self.assertFalse((self.root/'service-calls').exists())
+        self.cached('2.0.26')
+        self.run_manager('stop')
+        self.assertEqual((self.root/'service-calls').read_text().strip(),'service stop')
     def test_generated_xml_shell_and_sources(self):
         tree=ET.parse(ROOT/'opencode.plg')
         self.assertEqual(tree.getroot().get('min'),'7.1.4')

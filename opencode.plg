@@ -1,11 +1,12 @@
 <?xml version="1.0" standalone="yes"?>
-<PLUGIN name="opencode" author="tanushshukla" version="2026.09.12" min="7.1.4"
+<PLUGIN name="opencode" author="tanushshukla" version="2026.10.10" min="7.1.4"
  pluginURL="https://raw.githubusercontent.com/tanushshukla/unraid-opencode/main/opencode.plg"
  supportURL="https://github.com/tanushshukla/unraid-opencode/issues">
 <DESCRIPTION>OpenCode CLI with persistent appdata. Target: Unraid 7.1.4 and later.</DESCRIPTION>
-<CHANGES>2026.09.12: Initial release. Persistent storage, guarded migration, explicit updates and rollback.</CHANGES>
+<CHANGES>2026.10.10: OpenCode 2 support. Installs from the official npm packages with SHA-512 verification, backs up the database and configuration when switching between OpenCode 1 and 2, and stops the OpenCode 2 background server when the array stops.
+2026.09.12: Initial release. Persistent storage, guarded migration, explicit updates and rollback.</CHANGES>
 <FILE Run="/bin/bash"><INLINE><![CDATA[set -e
-mkdir -p /usr/local/emhttp/plugins/opencode/scripts /usr/local/bin
+mkdir -p /usr/local/emhttp/plugins/opencode/scripts /usr/local/emhttp/plugins/opencode/event /usr/local/bin
 if [ -e /usr/local/bin/opencode ] || [ -L /usr/local/bin/opencode ]; then
     if ! grep -q '/usr/local/emhttp/plugins/opencode/scripts/opencode-manager ensure' /usr/local/bin/opencode 2>/dev/null; then
         echo 'Existing /usr/local/bin/opencode found. Move it aside before installing this plugin.' >&2
@@ -39,29 +40,86 @@ prepare() {
         touch "$BASE/.migrated"
     fi
 }
+# Print the version reported by an executable, or nothing if it cannot run.
+binary_version() {
+    timeout 30 "$1" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*' | head -n 1 || true
+}
+# OpenCode 1.x and 2.x share appdata but differ in database and configuration format.
+series() { case $1 in 1.*) echo 1 ;; '') echo unknown ;; *) echo 2 ;; esac; }
+# OpenCode 2 runs a detached background server that would otherwise outlive sessions.
+stop_service() {
+    [[ -x "$BASE/bin/opencode" ]] || return 0
+    if [[ $(series "$(binary_version "$BASE/bin/opencode")") == 2 ]]; then
+        timeout 60 "$BASE/bin/opencode" service stop >/dev/null 2>&1 || true
+    fi
+    pkill -TERM -f "^$BASE/bin/opencode(\.previous)? serve --service" || true
+}
+# Replace the active binary; back up the database and configuration across 1.x/2.x changes.
+activate() {
+    local new=$1 old_version new_version backup
+    new_version=$(binary_version "$new")
+    if [[ -f "$BASE/bin/opencode" ]]; then
+        old_version=$(binary_version "$BASE/bin/opencode")
+        if [[ $(series "$old_version") != $(series "$new_version") ]]; then
+            stop_service
+            if pgrep -x opencode >/dev/null; then
+                fail 'Close all OpenCode sessions before switching between OpenCode 1 and 2; existing binary retained.'
+            fi
+            backup="$BASE/backup/${old_version:-unknown}-$(date +%Y%m%d-%H%M%S)"
+            mkdir -p "$backup/data"
+            cp -a "$BASE/config/opencode" "$backup/config" 2>/dev/null || true
+            cp -a "$BASE/data/opencode/"opencode*.db* "$backup/data/" 2>/dev/null || true
+            echo "Backed up database and configuration to $backup"
+        fi
+        cp -p "$BASE/bin/opencode" "$BASE/bin/.previous.tmp"
+    fi
+    mv -f "$new" "$BASE/bin/opencode"
+    if [[ -f "$BASE/bin/.previous.tmp" ]]; then
+        mv -f "$BASE/bin/.previous.tmp" "$BASE/bin/opencode.previous"
+    fi
+}
 install_binary() (
-    local version=${1:-latest} target=linux-x64 url stage
+    local version=${1:-latest} target=linux-x64 url stage meta scope integrity expected
     [[ $(uname -m) == x86_64 ]] || fail 'This plugin currently supports x86_64 only.'
     [[ "$version" == latest || "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || fail 'Invalid version.'
+    version=${version#v}
     grep -qwi avx2 /proc/cpuinfo || target=linux-x64-baseline
-    if [[ "$version" == latest ]]; then
-        url="https://github.com/anomalyco/opencode/releases/latest/download/opencode-$target.tar.gz"
-    else
-        url="https://github.com/anomalyco/opencode/releases/download/v${version#v}/opencode-$target.tar.gz"
-    fi
     stage=$(mktemp -d "$BASE/.install.XXXXXX")
     trap 'rm -rf -- "$stage"' EXIT
-    curl --fail --location --show-error --silent --connect-timeout 20 --max-time 600 --retry 2 "$url" -o "$stage/release.tar.gz" || fail 'Download failed; existing binary retained.'
-    # Extract only the expected executable, never arbitrary archive paths.
-    tar -xzf "$stage/release.tar.gz" -C "$stage" --no-same-owner --no-same-permissions opencode || fail 'Invalid release archive.'
+    get() { curl --fail --location --show-error --silent --connect-timeout 20 --max-time 600 --retry 2 "$@"; }
+    if [[ "$version" == 1.* ]]; then
+        # OpenCode 1.x is published as GitHub release assets without checksums.
+        url="https://github.com/anomalyco/opencode/releases/download/v$version/opencode-$target.tar.gz"
+        get "$url" -o "$stage/release.tar.gz" || fail 'Download failed; existing binary retained.'
+        # Extract only the expected executable, never arbitrary archive paths.
+        tar -xzf "$stage/release.tar.gz" -C "$stage" --no-same-owner --no-same-permissions opencode || fail 'Invalid release archive.'
+    else
+        # OpenCode 2 is published to npm, as used by https://opencode.ai/v2/install.
+        scope=@opencode
+        if [[ "$version" == latest ]]; then
+            meta=$(get https://opencode.ai/update/api/latest/cli/npm) || fail 'Could not fetch the latest version; existing binary retained.'
+            version=$(sed -n 's/.*"version":"\([^"]*\)".*/\1/p' <<< "$meta")
+            scope=$(sed -n 's/.*"package":"\([^"]*\)\/cli".*/\1/p' <<< "$meta")
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ && "$scope" =~ ^@opencode(-ai)?$ ]] || fail 'Unexpected version information.'
+        fi
+        # Older releases were published under the previous package scope.
+        meta=$(get "https://registry.npmjs.org/$scope%2fcli-$target/$version" 2>/dev/null) || {
+            scope=@opencode-ai
+            meta=$(get "https://registry.npmjs.org/$scope%2fcli-$target/$version") || fail "Version $version is not available for $target."
+        }
+        integrity=$(grep -oE '"integrity":"sha512-[A-Za-z0-9+/=]+"' <<< "$meta" | head -n 1 | sed 's/.*sha512-\([^"]*\)"/\1/')
+        [[ -n "$integrity" ]] || fail 'Missing package checksum.'
+        get "https://registry.npmjs.org/$scope/cli-$target/-/cli-$target-$version.tgz" -o "$stage/release.tgz" || fail 'Download failed; existing binary retained.'
+        expected=$(base64 -d <<< "$integrity" | od -An -vtx1 | tr -d ' \n')
+        [[ $(sha512sum "$stage/release.tgz" | cut -d' ' -f1) == "$expected" ]] || fail 'Checksum mismatch; existing binary retained.'
+        tar -xzf "$stage/release.tgz" -C "$stage" --no-same-owner --no-same-permissions package/bin/opencode || fail 'Invalid release archive.'
+        [[ -f "$stage/package/bin/opencode" && ! -L "$stage/package/bin/opencode" ]] || fail 'Missing executable.'
+        mv "$stage/package/bin/opencode" "$stage/opencode"
+    fi
     [[ -f "$stage/opencode" && ! -L "$stage/opencode" ]] || fail 'Missing executable.'
     chmod 700 "$stage/opencode"
     timeout 30 "$stage/opencode" --version || fail 'Binary cannot run on this server; existing binary retained.'
-    if [[ -f "$BASE/bin/opencode" ]]; then
-        cp -p "$BASE/bin/opencode" "$stage/previous"
-        mv -f "$stage/previous" "$BASE/bin/opencode.previous"
-    fi
-    mv -f "$stage/opencode" "$BASE/bin/opencode"
+    activate "$stage/opencode"
     echo 'OpenCode binary installed successfully.'
 )
 case "${1:-ensure}" in
@@ -73,6 +131,12 @@ case "${1:-ensure}" in
         echo 'Array not mounted yet. Run opencode after starting the array.'
         exit 0
         ;;
+    stop)
+        mounted || exit 0
+        export XDG_CONFIG_HOME="$BASE/config" XDG_DATA_HOME="$BASE/data"
+        export XDG_STATE_HOME="$BASE/state" XDG_CACHE_HOME="$BASE/cache"
+        stop_service
+        ;;
     ensure|update|rollback)
         mounted || fail 'Start the array first; /mnt/user is not mounted.'
         exec 9>/var/lock/opencode-plugin.lock
@@ -83,14 +147,16 @@ case "${1:-ensure}" in
         case "${1:-ensure}" in
             ensure) [[ -x "$BASE/bin/opencode" ]] || install_binary ;;
             update) install_binary "${2:-latest}" ;;
-            rollback)
+            rollback) (
                 [[ -x "$BASE/bin/opencode.previous" ]] || fail 'No previous binary available.'
+                trap 'rm -f -- "$BASE/bin/opencode.restore"' EXIT
                 cp -p "$BASE/bin/opencode.previous" "$BASE/bin/opencode.restore"
-                mv -f "$BASE/bin/opencode.restore" "$BASE/bin/opencode"
-                ;;
+                activate "$BASE/bin/opencode.restore"
+                echo "Previous OpenCode binary restored. Database backups, if any, are in $BASE/backup"
+                ) ;;
         esac
         ;;
-    *) fail 'Usage: opencode-manager {ensure|update [version]|rollback|boot}' ;;
+    *) fail 'Usage: opencode-manager {ensure|update [version]|rollback|stop|boot}' ;;
 esac
 
 ]]></INLINE></FILE>
@@ -105,6 +171,9 @@ export XDG_CACHE_HOME="$BASE/cache"
 exec "$BASE/bin/opencode" "$@"
 
 ]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/opencode/event/stopping" Mode="0755"><INLINE><![CDATA[#!/bin/bash
+/usr/local/emhttp/plugins/opencode/scripts/opencode-manager stop
+]]></INLINE></FILE>
 <FILE Run="/bin/bash"><INLINE><![CDATA[nohup /bin/bash /usr/local/emhttp/plugins/opencode/scripts/opencode-manager boot > /var/log/opencode-plugin.log 2>&1 < /dev/null &
 echo 'OpenCode plugin installed. Start the array, then run /usr/local/bin/opencode.'
 echo 'Download/setup progress: /var/log/opencode-plugin.log' 
@@ -114,11 +183,13 @@ echo 'Download/setup progress: /var/log/opencode-plugin.log'
 exec 9>/var/lock/opencode-plugin.lock
 flock -w 660 9
 pkill -f '^/bin/bash /usr/local/emhttp/plugins/opencode/scripts/opencode-manager boot$' || true
+# The OpenCode 2 background server is detached; stop it so it cannot block stopping the array.
+/usr/local/emhttp/plugins/opencode/scripts/opencode-manager stop || true
 if grep -q '/usr/local/emhttp/plugins/opencode/scripts/opencode-manager ensure' /usr/local/bin/opencode 2>/dev/null; then
     rm -f /usr/local/bin/opencode
 fi
-rm -f /usr/local/emhttp/plugins/opencode/scripts/opencode-manager
-rmdir /usr/local/emhttp/plugins/opencode/scripts /usr/local/emhttp/plugins/opencode 2>/dev/null || true
-echo 'Plugin removed. All appdata and existing running sessions were preserved.' 
+rm -f /usr/local/emhttp/plugins/opencode/scripts/opencode-manager /usr/local/emhttp/plugins/opencode/event/stopping
+rmdir /usr/local/emhttp/plugins/opencode/scripts /usr/local/emhttp/plugins/opencode/event /usr/local/emhttp/plugins/opencode 2>/dev/null || true
+echo 'Plugin removed. All appdata was preserved; the OpenCode 2 background server was stopped.' 
 ]]></INLINE></FILE>
 </PLUGIN>
