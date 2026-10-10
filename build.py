@@ -4,11 +4,12 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 root = Path(__file__).resolve().parent
 parts = ['''<?xml version="1.0" standalone="yes"?>
-<PLUGIN name="opencode" author="tanushshukla" version="2026.10.10" min="7.1.4"
+<PLUGIN name="opencode" author="tanushshukla" version="2026.10.10a" min="7.1.4"
  pluginURL="https://raw.githubusercontent.com/tanushshukla/unraid-opencode/main/opencode.plg"
  supportURL="https://github.com/tanushshukla/unraid-opencode/issues">
 <DESCRIPTION>OpenCode CLI with persistent appdata. Target: Unraid 7.1.4 and later.</DESCRIPTION>
-<CHANGES>2026.10.10: OpenCode 2 support. Installs from the official npm packages with SHA-512 verification, backs up the database and configuration when switching between OpenCode 1 and 2, and stops the OpenCode 2 background server when the array stops.
+<CHANGES>2026.10.10a: Fix plugin updates leaving the previous management script in place.
+2026.10.10: OpenCode 2 support. Installs from the official npm packages with SHA-512 verification, backs up the database and configuration when switching between OpenCode 1 and 2, and stops the OpenCode 2 background server when the array stops.
 2026.09.12: Initial release. Persistent storage, guarded migration, explicit updates and rollback.</CHANGES>
 ''']
 def entry(body, attrs):
@@ -21,7 +22,9 @@ if [ -e /usr/local/bin/opencode ] || [ -L /usr/local/bin/opencode ]; then
         echo 'Existing /usr/local/bin/opencode found. Move it aside before installing this plugin.' >&2
         exit 1
     fi
-fi''', 'Run="/bin/bash"')
+fi
+# Unraid does not overwrite existing files, so remove ours to let updates replace them.
+rm -f /usr/local/bin/opencode /usr/local/emhttp/plugins/opencode/scripts/opencode-manager /usr/local/emhttp/plugins/opencode/event/stopping''', 'Run="/bin/bash"')
 for src, dest in [
     ('scripts/opencode-manager', '/usr/local/emhttp/plugins/opencode/scripts/opencode-manager'),
     ('scripts/opencode', '/usr/local/bin/opencode'),

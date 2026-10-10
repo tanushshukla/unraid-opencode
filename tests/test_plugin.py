@@ -191,6 +191,11 @@ if [[ -n "$out" ]]; then cp "$f" "$out"; else cat "$f"; fi''')
             script=f.findtext('INLINE')
             subprocess.run(['bash','-n'],input=script,text=True,check=True)
         self.assertIn((ROOT/'scripts/opencode-manager').read_text(),(ROOT/'opencode.plg').read_text())
+        # Unraid skips files that already exist, so updates must remove them first.
+        names=[f.get('Name') for f in tree.findall('FILE') if f.get('Name')]
+        first=tree.findall('FILE')[0].findtext('INLINE')
+        for name in names:
+            self.assertIn(name, first.split('rm -f ')[-1])
 
 if __name__=='__main__':
     unittest.main()
